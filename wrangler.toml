@@ -1,4 +1,4 @@
-name = "web-proxy"
+name = "web-browser"
 main = "index.js"
 compatibility_date = "2026-09-15"
 
