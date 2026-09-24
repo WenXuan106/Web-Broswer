@@ -1,0 +1,7 @@
+name = "web-proxy"
+main = "index.js"
+compatibility_date = "2026-09-15"
+
+kv_namespaces = [
+  { binding = "CACHE_KV", id = "47274108b86041d6aa581f4bc9bc3dd7" }
+]
