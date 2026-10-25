@@ -1,13 +1,64 @@
 /**
- * Reverse proxy Worker with a built-in tabbed "browser" shell.
+ * Generic web proxy / "browser" worker.
  *
- * - Open  https://<your-worker-domain>/__browser  to use the tabbed browser.
- * - Every other path is proxied to baseHost, same as before.
- * - baseHost has NO trailing slash, because pathname already starts with "/".
+ * - Visit /__browser for the tabbed browser UI (tabs, address bar,
+ *   back/forward/reload). New-tab links and window.open() open a new tab
+ *   inside the page instead of a real browser tab.
+ * - Visit / with no params for a simple address bar.
+ * - /?url=https://example.com proxies that page and rewrites its links,
+ *   forms, and resource references so browsing keeps flowing through here.
+ *
+ * Optional: bind a KV namespace named CACHE_KV to enable response caching.
  */
-const baseHost = 'https://www.ytdwlr.lol'
+
+/**
+ * Path of the tabbed browser UI.
+ */
 const SHELL_PATH = '/__browser'
 
+/**
+ * How long cached responses stay valid, in seconds.
+ */
+const CACHE_TTL_SECONDS = 60
+
+/**
+ * Chunk size used when converting bytes to base64, to avoid blowing the
+ * call stack with String.fromCharCode(...bigArray) on large responses.
+ */
+const BASE64_CHUNK_SIZE = 8192
+
+/**
+ * Per the Fetch spec, responses with these statuses MUST have a null body.
+ * Passing a non-null body alongside one of these statuses throws.
+ */
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304])
+
+/**
+ * Private / reserved IP ranges we refuse to proxy to, so this worker
+ * can't be used to poke at internal infrastructure (basic SSRF guard).
+ * This is a best-effort textual check on the hostname, not a full
+ * DNS-resolution-based guard.
+ */
+const BLOCKED_HOSTNAME_PATTERNS = [
+  /^localhost$/i,
+  /^127\./,
+  /^0\./,
+  /^10\./,
+  /^169\.254\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[0-1])\./,
+  /^\[?::1\]?$/,
+  /^\[?fc[0-9a-f]{2}:/i,
+  /^\[?fe80:/i,
+  /\.internal$/i
+]
+
+/**
+ * The tabbed browser page. Each tab is an iframe pointing at this same
+ * worker (/?url=...). Because the proxied pages are served from this
+ * worker's origin, the shell can reach into each iframe to catch
+ * "open in new tab" behaviour.
+ */
 const SHELL_HTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -51,35 +102,55 @@ const SHELL_HTML = `<!DOCTYPE html>
     <button id="back" title="Back">&#8592;</button>
     <button id="forward" title="Forward">&#8594;</button>
     <button id="reload" title="Reload">&#8635;</button>
-    <form id="urlform"><input id="url" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Enter a path or URL"></form>
+    <form id="urlform"><input id="url" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Enter a URL or search"></form>
   </div>
   <div id="view"></div>
 </div>
 <script>
 (function () {
-  var BASE = __BASE__;
   var tabsEl = document.getElementById('tabs');
   var newTabBtn = document.getElementById('newtab');
   var viewEl = document.getElementById('view');
   var urlEl = document.getElementById('url');
   var tabs = [];
   var active = null;
-  var nextId = 1;
   var realOpen = window.open.bind(window);
 
-  // Turn any URL into a path on this Worker, or null if it is a different site
-  function toPath(input, base) {
+  // The real (un-proxied) URL a proxied address points at
+  function realUrlOf(href) {
+    try { return new URL(href).searchParams.get('url') || ''; } catch (e) { return ''; }
+  }
+
+  // Turn any URL into a proxied /?url=... link, or null if it can't be
+  function proxify(raw, base) {
     try {
-      var u = new URL(input, base || location.href);
-      if (u.origin === location.origin || u.origin === BASE) {
-        return u.pathname + u.search + u.hash;
+      var u = new URL(raw, base);
+      if (u.origin === location.origin) {
+        return u.searchParams.get('url') ? u.href : null;
+      }
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        return location.origin + '/?url=' + encodeURIComponent(u.href);
       }
     } catch (e) {}
     return null;
   }
 
-  function newTab(path) {
-    var tab = { id: nextId++, path: path || '/', title: 'New tab' };
+  // Address-bar text -> proxied path (URL, bare domain, or a search)
+  function fromAddressBar(v) {
+    var low = v.toLowerCase();
+    var full;
+    if (low.indexOf('http://') === 0 || low.indexOf('https://') === 0) {
+      full = v;
+    } else if (v.indexOf(' ') === -1 && v.indexOf('.') !== -1) {
+      full = 'https://' + v;
+    } else {
+      full = 'https://duckduckgo.com/html/?q=' + encodeURIComponent(v);
+    }
+    return '/?url=' + encodeURIComponent(full);
+  }
+
+  function newTab(src) {
+    var tab = { src: src || '/', real: '', title: 'New tab' };
 
     var frame = document.createElement('iframe');
     frame.setAttribute('allow', 'fullscreen');
@@ -100,13 +171,12 @@ const SHELL_HTML = `<!DOCTYPE html>
 
     el.addEventListener('click', function () { activate(tab); });
     close.addEventListener('click', function (e) { e.stopPropagation(); closeTab(tab); });
-
     frame.addEventListener('load', function () { hook(tab); sync(tab); });
 
     tabsEl.insertBefore(el, newTabBtn);
     viewEl.appendChild(frame);
     tabs.push(tab);
-    frame.src = tab.path;
+    frame.src = tab.src;
     activate(tab);
     return tab;
   }
@@ -117,7 +187,7 @@ const SHELL_HTML = `<!DOCTYPE html>
       t.el.classList.toggle('active', t === tab);
       t.frame.classList.toggle('active', t === tab);
     });
-    urlEl.value = tab.path;
+    urlEl.value = tab.real;
     document.title = tab.title;
   }
 
@@ -134,71 +204,79 @@ const SHELL_HTML = `<!DOCTYPE html>
   function sync(tab) {
     try {
       var w = tab.frame.contentWindow;
-      tab.path = w.location.pathname + w.location.search + w.location.hash;
-      tab.title = w.document.title || tab.path;
+      tab.real = realUrlOf(w.location.href);
+      tab.title = w.document.title || tab.real || 'New tab';
     } catch (e) {}
     tab.label.textContent = tab.title;
     if (tab === active) {
-      if (document.activeElement !== urlEl) urlEl.value = tab.path;
+      if (document.activeElement !== urlEl) urlEl.value = tab.real;
       document.title = tab.title;
     }
   }
 
-  function openLink(url, base) {
-    var p = toPath(url, base);
-    if (p !== null) newTab(p);
-    else realOpen(url, '_blank'); // other sites can't be proxied here
+  function openLink(raw, w) {
+    var base = realUrlOf(w.location.href) || w.location.href;
+    var p = proxify(raw, base);
+    if (p) newTab(p);
+    else realOpen(raw, '_blank'); // mailto:, tel:, etc.
   }
 
-  // Runs on every page load inside a tab: catch "open in new tab" behaviour
+  // Runs on every page load inside a tab
   function hook(tab) {
     var w, d;
     try { w = tab.frame.contentWindow; d = w.document; } catch (e) { return; }
 
+    // window.open(...) -> new tab in the shell
     w.open = function (url) {
-      if (url) openLink(url, w.location.href);
+      if (url) openLink(String(url), w);
       return null;
     };
 
+    // target="_blank" links, Ctrl/Cmd-click, middle-click -> new tab
     function onLink(e) {
       var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (!a) return;
+      if (e.type === 'auxclick' && e.button !== 1) return;
       var baseEl = d.querySelector('base[target]');
-      var target = a.getAttribute('target') || (baseEl ? baseEl.getAttribute('target') : '');
-      var named = target && target !== '_self' && target !== '_parent' && target !== '_top';
+      var t = a.getAttribute('target') || (baseEl ? baseEl.getAttribute('target') : '');
+      var named = t && t !== '_self' && t !== '_parent' && t !== '_top';
       var modifier = e.ctrlKey || e.metaKey || e.button === 1;
       if (!named && !modifier) return;
-      if (e.type === 'auxclick' && e.button !== 1) return;
       e.preventDefault();
-      openLink(a.href, w.location.href);
+      openLink(a.href, w);
     }
     d.addEventListener('click', onLink, true);
     d.addEventListener('auxclick', onLink, true);
 
-    // Forms that target a new window just submit in the current tab
+    // Forms: GET forms would lose the ?url= param, so rebuild the URL here
     d.addEventListener('submit', function (e) {
       var f = e.target;
-      var t = f.getAttribute && f.getAttribute('target');
-      if (t && t !== '_self' && t !== '_parent' && t !== '_top') {
+      if (!f || !f.getAttribute) return;
+      var t = f.getAttribute('target');
+      var wantsNew = t && t !== '_self' && t !== '_parent' && t !== '_top';
+      var method = (f.getAttribute('method') || 'get').toLowerCase();
+
+      if (method === 'get') {
+        var real = '';
+        try { real = new URL(f.action, w.location.href).searchParams.get('url') || ''; } catch (err) {}
+        if (!real) return; // e.g. the landing page's own form: let it submit
+        e.preventDefault();
+        var target = new URL(real);
+        target.search = new URLSearchParams(new FormData(f)).toString();
+        var proxied = location.origin + '/?url=' + encodeURIComponent(target.href);
+        if (wantsNew) newTab(proxied);
+        else w.location.href = proxied;
+      } else if (wantsNew) {
         f.setAttribute('target', '_self');
       }
     }, true);
   }
 
-  function normalize(v) {
-    if (/^https?:/i.test(v)) {
-      return toPath(v);
-    }
-    return v.charAt(0) === '/' ? v : '/' + v;
-  }
-
-  document.getElementById('urlform').addEventListener('submit', function (e) {
+  urlEl.form.addEventListener('submit', function (e) {
     e.preventDefault();
     var v = urlEl.value.trim();
     if (!v || !active) return;
-    var p = normalize(v);
-    if (p === null) { alert('Only ' + BASE + ' pages can be opened here.'); return; }
-    active.frame.src = p;
+    active.frame.src = fromAddressBar(v);
     urlEl.blur();
   });
 
@@ -217,19 +295,212 @@ const SHELL_HTML = `<!DOCTYPE html>
   // Keep title/address bar fresh for single-page-app navigation
   setInterval(function () { if (active) sync(active); }, 500);
 
-  var start = new URLSearchParams(location.search).get('start') || '/';
-  newTab(start);
+  var start = new URLSearchParams(location.search).get('start');
+  newTab(start ? fromAddressBar(start) : '/');
 })();
 </script>
 </body>
 </html>`
 
-async function handleRequest (request) {
-  const requestUrl = new URL(request.url)
+/**
+ * Converts an ArrayBuffer to a base64 string without spreading the whole
+ * array into function arguments (which crashes on large files).
+ * @param {ArrayBuffer} buffer
+ */
+function arrayBufferToBase64 (buffer) {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += BASE64_CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, i + BASE64_CHUNK_SIZE)
+    binary += String.fromCharCode(...chunk)
+  }
+  return btoa(binary)
+}
 
-  // The tabbed browser UI
+/**
+ * Converts a base64 string back into a Uint8Array.
+ * @param {string} base64
+ */
+function base64ToUint8Array (base64) {
+  const binaryString = atob(base64)
+  const bytes = new Uint8Array(binaryString.length)
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i)
+  }
+  return bytes
+}
+
+/**
+ * Serializes a fetch Response into a JSON-friendly object we can store in KV.
+ * @param {Response} response
+ */
+async function serializeResponse (response) {
+  const arrayBuffer = await response.arrayBuffer()
+
+  return JSON.stringify({
+    body: arrayBufferToBase64(arrayBuffer),
+    status: response.status,
+    statusText: response.statusText,
+    headers: [...response.headers.entries()]
+  })
+}
+
+/**
+ * Rebuilds a Response object from a serialized KV entry.
+ * @param {string} serialized
+ */
+function deserializeResponse (serialized) {
+  const parsed = JSON.parse(serialized)
+  const body = NULL_BODY_STATUSES.has(parsed.status)
+    ? null
+    : base64ToUint8Array(parsed.body)
+
+  // The stored bytes are already decoded, so drop encoding/length headers.
+  const headers = new Headers(parsed.headers)
+  headers.delete('content-encoding')
+  headers.delete('content-length')
+
+  return new Response(body, {
+    status: parsed.status,
+    statusText: parsed.statusText,
+    headers
+  })
+}
+
+/**
+ * WebSocket upgrade requests need to pass straight through, untouched.
+ * @param {Request} request
+ */
+function isWebSocketUpgrade (request) {
+  return request.headers.get('Upgrade')?.toLowerCase() === 'websocket'
+}
+
+/**
+ * Builds this worker's own base URL (scheme + host) from the incoming request.
+ * @param {URL} requestUrl
+ */
+function proxyOrigin (requestUrl) {
+  return `${requestUrl.protocol}//${requestUrl.host}`
+}
+
+/**
+ * Turns a target URL into a proxied "/?url=..." link on this worker.
+ * @param {string} targetUrl
+ * @param {string} origin
+ */
+function toProxied (targetUrl, origin) {
+  return `${origin}/?url=${encodeURIComponent(targetUrl)}`
+}
+
+/**
+ * Resolves a possibly-relative URL found in the page against the page's
+ * own URL, and rewrites it into a proxied link. Leaves things like
+ * mailto:, javascript:, tel:, and data: URIs untouched.
+ * @param {string} raw
+ * @param {string} baseUrl
+ * @param {string} origin
+ */
+function rewriteUrl (raw, baseUrl, origin) {
+  if (!raw) return raw
+  const trimmed = raw.trim()
+  if (/^(mailto|javascript|tel|data|#)/i.test(trimmed)) return raw
+  try {
+    const resolved = new URL(trimmed, baseUrl).toString()
+    return toProxied(resolved, origin)
+  } catch (err) {
+    return raw
+  }
+}
+
+function isBlockedHostname (hostname) {
+  return BLOCKED_HOSTNAME_PATTERNS.some(pattern => pattern.test(hostname))
+}
+
+/**
+ * Simple address-bar landing page shown when no ?url= is given.
+ */
+function renderHomePage (origin, errorMessage) {
+  const safeError = errorMessage
+    ? `<p class="error">${errorMessage.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</p>`
+    : ''
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Proxy</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  form { width: 100%; max-width: 560px; padding: 0 20px; }
+  h1 { font-size: 1.3rem; margin-bottom: 1rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 1rem; border-radius: 8px; border: 1px solid #444; background: #1c1c1c; color: #eee; }
+  button { margin-top: 10px; width: 100%; padding: 12px; font-size: 1rem; border-radius: 8px; border: none; background: #4f7cff; color: white; cursor: pointer; }
+  button:hover { background: #3a63e0; }
+  .error { color: #ff6b6b; }
+</style>
+</head>
+<body>
+  <form action="${origin}/" method="get">
+    <h1>Enter a URL to browse</h1>
+    ${safeError}
+    <input type="text" name="url" placeholder="https://example.com" autofocus>
+    <button type="submit">Go</button>
+  </form>
+</body>
+</html>`
+}
+
+/**
+ * Rewrites an outgoing HTML response so that navigation, forms, and
+ * subresources keep flowing back through this proxy.
+ * @param {Response} response
+ * @param {string} targetUrl the URL that was actually fetched
+ * @param {string} origin this worker's own origin
+ */
+function rewriteHtml (response, targetUrl, origin) {
+  const attributeRewriter = {
+    element (element) {
+      const attr = element.tagName === 'form' ? 'action' : (element.hasAttribute('src') ? 'src' : 'href')
+      const value = element.getAttribute(attr)
+      if (value) {
+        element.setAttribute(attr, rewriteUrl(value, targetUrl, origin))
+      }
+    }
+  }
+
+  const metaRefreshRewriter = {
+    element (element) {
+      const httpEquiv = element.getAttribute('http-equiv')
+      if (httpEquiv && httpEquiv.toLowerCase() === 'refresh') {
+        const content = element.getAttribute('content') || ''
+        const match = content.match(/url=(.+)$/i)
+        if (match) {
+          const rewritten = rewriteUrl(match[1], targetUrl, origin)
+          element.setAttribute('content', content.slice(0, match.index) + 'url=' + rewritten)
+        }
+      }
+    }
+  }
+
+  return new HTMLRewriter()
+    .on('a[href]', attributeRewriter)
+    .on('link[href]', attributeRewriter)
+    .on('img[src]', attributeRewriter)
+    .on('script[src]', attributeRewriter)
+    .on('iframe[src]', attributeRewriter)
+    .on('form[action]', attributeRewriter)
+    .on('meta[http-equiv]', metaRefreshRewriter)
+    .transform(response)
+}
+
+async function handleRequest (request, env, ctx) {
+  const requestUrl = new URL(request.url)
+  const origin = proxyOrigin(requestUrl)
+
+  // The tabbed browser UI.
   if (requestUrl.pathname === SHELL_PATH) {
-    return new Response(SHELL_HTML.replace('__BASE__', JSON.stringify(baseHost)), {
+    return new Response(SHELL_HTML, {
       headers: {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store'
@@ -237,43 +508,140 @@ async function handleRequest (request) {
     })
   }
 
-  // Everything else is proxied to baseHost
-  const targetUrl = baseHost + requestUrl.pathname + requestUrl.search
-  const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
+  const targetParam = requestUrl.searchParams.get('url')
 
-  const proxyRequest = new Request(targetUrl, {
+  // No target URL given: show the address-bar landing page.
+  if (!targetParam) {
+    return new Response(renderHomePage(origin), {
+      headers: { 'content-type': 'text/html; charset=utf-8' }
+    })
+  }
+
+  let targetUrl
+  try {
+    targetUrl = new URL(targetParam.startsWith('http') ? targetParam : `https://${targetParam}`)
+  } catch (err) {
+    return new Response(renderHomePage(origin, 'That does not look like a valid URL.'), {
+      status: 400,
+      headers: { 'content-type': 'text/html; charset=utf-8' }
+    })
+  }
+
+  if (!['http:', 'https:'].includes(targetUrl.protocol)) {
+    return new Response(renderHomePage(origin, 'Only http:// and https:// URLs are supported.'), {
+      status: 400,
+      headers: { 'content-type': 'text/html; charset=utf-8' }
+    })
+  }
+
+  if (isBlockedHostname(targetUrl.hostname)) {
+    return new Response(renderHomePage(origin, 'That host cannot be proxied.'), {
+      status: 403,
+      headers: { 'content-type': 'text/html; charset=utf-8' }
+    })
+  }
+
+  // WebSocket traffic bypasses all caching/rewriting: pass it through.
+  if (isWebSocketUpgrade(request)) {
+    const wsHeaders = new Headers(request.headers)
+    const wsRequest = new Request(targetUrl.toString(), {
+      method: request.method,
+      headers: wsHeaders
+    })
+    return fetch(wsRequest)
+  }
+
+  const cacheKey = `${request.method}:${targetUrl.toString()}`
+  const isCacheable = request.method === 'GET'
+
+  if (isCacheable && env.CACHE_KV) {
+    try {
+      const cached = await env.CACHE_KV.get(cacheKey)
+      if (cached) {
+        let cachedResponse = deserializeResponse(cached)
+        cachedResponse.headers.set('X-Cache-Status', 'HIT')
+        // Same framing/CSP stripping as a fresh response, so cached pages
+        // can still be shown inside the browser tabs.
+        cachedResponse.headers.delete('content-security-policy')
+        cachedResponse.headers.delete('x-frame-options')
+        const contentType = cachedResponse.headers.get('content-type') || ''
+        if (contentType.includes('text/html')) {
+          cachedResponse = rewriteHtml(cachedResponse, targetUrl.toString(), origin)
+        }
+        return cachedResponse
+      }
+    } catch (err) {
+      console.error('KV read failed, falling back to origin:', err)
+    }
+  }
+
+  const proxyHeaders = new Headers(request.headers)
+  proxyHeaders.delete('if-none-match')
+  proxyHeaders.delete('if-modified-since')
+  proxyHeaders.set('host', targetUrl.host)
+  // Don't leak the proxy's own address as the referer.
+  proxyHeaders.delete('referer')
+
+  const proxyRequest = new Request(targetUrl.toString(), {
     method: request.method,
-    headers: request.headers,
-    body: hasBody ? request.body : undefined,
-    redirect: 'manual', // don't silently follow redirects to the origin domain
-    cf: request.method === 'GET'
-      ? { cacheTtl: 10, cacheEverything: true }
-      : undefined
+    headers: proxyHeaders,
+    body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
+    redirect: 'manual'
   })
 
-  const response = await fetch(proxyRequest)
+  let response = await fetch(proxyRequest)
 
-  // Copy of the response with mutable headers
-  const proxied = new Response(response.body, response)
-
-  // Keep redirects on your own domain
-  const location = proxied.headers.get('Location')
-  if (location) {
-    proxied.headers.set('Location', location.replace(baseHost, requestUrl.origin))
+  // Follow redirects ourselves so the browser stays pointed at the proxy.
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get('location')
+    if (location) {
+      const resolved = new URL(location, targetUrl).toString()
+      return Response.redirect(toProxied(resolved, origin), response.status)
+    }
   }
 
-  // Allow the site to be shown inside the browser shell's iframes
-  proxied.headers.delete('X-Frame-Options')
-  const csp = proxied.headers.get('Content-Security-Policy')
-  if (csp) {
-    const cleaned = csp.replace(/frame-ancestors[^;]*;?/gi, '').trim()
-    if (cleaned) proxied.headers.set('Content-Security-Policy', cleaned)
-    else proxied.headers.delete('Content-Security-Policy')
+  let responseForCache = null
+  if (isCacheable && env.CACHE_KV && response.ok) {
+    try {
+      responseForCache = response.clone()
+    } catch (err) {
+      console.error('Could not clone response for caching:', err)
+    }
   }
 
-  return proxied
+  const bodyForClient = NULL_BODY_STATUSES.has(response.status) ? null : response.body
+  let finalResponse = new Response(bodyForClient, response)
+  finalResponse.headers.set('X-Cache-Status', 'MISS')
+  // Frames of the proxied page shouldn't be blocked by the origin's own
+  // framing/CSP rules, since we're serving it from our own origin anyway.
+  finalResponse.headers.delete('content-security-policy')
+  finalResponse.headers.delete('x-frame-options')
+
+  if (responseForCache) {
+    ctx.waitUntil(
+      serializeResponse(responseForCache)
+        .then(serialized =>
+          env.CACHE_KV.put(cacheKey, serialized, { expirationTtl: CACHE_TTL_SECONDS })
+        )
+        .catch(err => console.error('KV write failed:', err))
+    )
+  }
+
+  const contentType = finalResponse.headers.get('content-type') || ''
+  if (contentType.includes('text/html')) {
+    finalResponse = rewriteHtml(finalResponse, targetUrl.toString(), origin)
+  }
+
+  return finalResponse
 }
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request))
-})
+export default {
+  async fetch (request, env, ctx) {
+    try {
+      return await handleRequest(request, env, ctx)
+    } catch (err) {
+      console.error('Unhandled error in worker:', err)
+      return new Response('Something went wrong upstream. Please try again.', { status: 502 })
+    }
+  }
+}
